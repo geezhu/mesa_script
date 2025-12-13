@@ -2,7 +2,6 @@ name: Mirror GitLab -> GitHub (mesa)
 
 on:
   schedule:
-    # 每小时同步一次
     - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
@@ -20,12 +19,10 @@ on:
         required: true
         default: "geezhu/mesa"
 
-# 避免定时任务重叠执行
 concurrency:
-  group: mirror-mesa-demos
+  group: mirror-mesa
   cancel-in-progress: true
 
-# 控制仓库本身不需要写权限；写目标仓库靠 PAT
 permissions:
   contents: read
 
@@ -33,9 +30,11 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     env:
-      SOURCE_URL: ${{ inputs.source_url || 'https://gitlab.freedesktop.org/mesa/mesa.git' }}
-      TARGET_REPO: ${{ inputs.target_repo || 'geezhu/mesa' }}
-      MODE: ${{ inputs.mode || 'heads-tags' }}
+      SOURCE_URL: ${{ github.event.inputs.source_url || 'https://gitlab.freedesktop.org/mesa/mesa.git' }}
+      TARGET_REPO: ${{ github.event.inputs.target_repo || 'geezhu/mesa' }}
+      MODE: ${{ github.event.inputs.mode || 'heads-tags' }}
+      # 首次 seed 分块大小：越大越快但越容易超限；mesa 这种建议 500~2000 之间试
+      SEED_STEP: "1000"
 
     steps:
       - name: Clone source repo (mirror)
@@ -53,24 +52,94 @@ jobs:
 
           cd /tmp/src.git
           git remote add target "https://x-access-token:${TARGET_REPO_PAT}@github.com/${TARGET_REPO}.git"
-
-          # 禁止 git 交互式提示（避免卡住）
           git config --local core.askPass true
 
-      - name: Push to target repo
+      - name: Push to target repo (staged)
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
         run: |
           set -euo pipefail
           cd /tmp/src.git
 
-          if [ "${MODE}" = "mirror" ]; then
-            echo "Mode: mirror (DANGEROUS: fully overwrite target refs)"
-            git push --mirror target
-          else
-            echo "Mode: heads-tags (sync branches + tags only)"
-            git push --prune target \
-              +refs/heads/*:refs/heads/* \
-              +refs/tags/*:refs/tags/*
+          retry() {
+            # retry <cmd...>
+            for n in 1 2 3; do
+              "$@" && return 0
+              echo "Command failed (attempt $n): $*"
+              sleep $((n*20))
+            done
+            return 1
+          }
+
+          # 获取源仓库默认分支（不依赖 remote show 文本输出）
+          DEFAULT_REF="$(git ls-remote --symref origin HEAD | awk '/^ref:/ {print $2}' | head -n1)"
+          DEFAULT_BRANCH="${DEFAULT_REF#refs/heads/}"
+          if [ -z "${DEFAULT_BRANCH}" ] || [ "${DEFAULT_BRANCH}" = "${DEFAULT_REF}" ]; then
+            echo "Failed to detect default branch from origin HEAD"
+            exit 1
           fi
+          echo "Default branch detected: ${DEFAULT_BRANCH}"
+
+          # 判断目标仓库是否“空”（没有任何 heads）
+          if ! git ls-remote --heads target | grep -q "refs/heads/"; then
+            echo "Target repo appears empty -> seeding ${DEFAULT_BRANCH} in chunks to avoid huge single push."
+
+            STEP="${SEED_STEP}"
+            if ! [[ "${STEP}" =~ ^[0-9]+$ ]] || [ "${STEP}" -lt 100 ]; then
+              STEP=1000
+            fi
+
+            # 取默认分支提交列表（从旧到新）
+            mapfile -t COMMITS < <(git rev-list --reverse "refs/heads/${DEFAULT_BRANCH}")
+            total="${#COMMITS[@]}"
+            echo "Total commits on ${DEFAULT_BRANCH}: ${total}"
+
+            if [ "${total}" -eq 0 ]; then
+              echo "No commits found on ${DEFAULT_BRANCH}"
+              exit 1
+            fi
+
+            i="${STEP}"
+            while [ "${i}" -lt "${total}" ]; do
+              sha="${COMMITS[$((i-1))]}"
+              echo "Seeding ${DEFAULT_BRANCH}: commit ${i}/${total} -> ${sha} (STEP=${STEP})"
+
+              if retry git push target "+${sha}:refs/heads/${DEFAULT_BRANCH}"; then
+                i=$((i+STEP))
+              else
+                STEP=$((STEP/2))
+                if [ "${STEP}" -lt 100 ]; then
+                  echo "Seeding keeps failing even with small STEP; abort."
+                  exit 1
+                fi
+                echo "Push failed; reducing STEP to ${STEP} and retrying..."
+              fi
+            done
+
+            echo "Final push of ${DEFAULT_BRANCH} tip"
+            retry git push target "+refs/heads/${DEFAULT_BRANCH}:refs/heads/${DEFAULT_BRANCH}"
+          else
+            echo "Target repo already has heads -> skip seeding."
+          fi
+
+          if [ "${MODE}" = "mirror" ]; then
+            echo "Mode: mirror (overwrite all refs)."
+            # 经过 seed 后，一般会变成“推 refs 变化为主”，更不容易触发超大 pack
+            retry git push --mirror target
+            exit 0
+          fi
+
+          echo "Mode: heads-tags (push branches one-by-one, then tags)."
+
+          # 逐分支推送（比一次性 refs/heads/* 更稳）
+          while IFS= read -r b; do
+            [ -z "$b" ] && continue
+            echo "Pushing branch: $b"
+            retry git push target "+refs/heads/$b:refs/heads/$b"
+          done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+
+          echo "Pushing tags..."
+          retry git push target --tags
 
       - name: Cleanup
         if: always()
