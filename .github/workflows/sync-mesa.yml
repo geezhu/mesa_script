@@ -129,34 +129,33 @@ jobs:
 
           LIST_FILE="${GITHUB_WORKSPACE}/bad_tag_objects.txt"
           if [ -f "$LIST_FILE" ]; then
-            # 映射：tag_object_sha -> tag_name -> peeled_target
-            git for-each-ref refs/tags --format='%(objectname) %(refname:short) %(peeled)' > /tmp/tag_map.txt
-
+            # 建映射：tag_object_sha -> tag_name（只保留 annotated tag：objecttype==tag）
+            git for-each-ref refs/tags --format='%(objectname) %(objecttype) %(refname:short)' \
+              | awk '$2=="tag"{print $1, $3}' > /tmp/tagobj_to_name.txt
+          
             while read -r tagobj; do
               [ -z "$tagobj" ] && continue
               [[ "$tagobj" =~ ^# ]] && continue
-
-              line="$(awk -v s="$tagobj" '$1==s {print; exit}' /tmp/tag_map.txt || true)"
-              if [ -z "$line" ]; then
-                echo "WARN: cannot map bad tag object $tagobj to a tag name (maybe removed upstream); skip"
+          
+              tag="$(awk -v s="$tagobj" '$1==s {print $2; exit}' /tmp/tagobj_to_name.txt || true)"
+              if [ -z "$tag" ]; then
+                echo "WARN: cannot map bad tag object $tagobj to a tag name; skip"
                 continue
               fi
-
-              tag="$(echo "$line" | awk '{print $2}')"
-              peeled="$(echo "$line" | awk '{print $3}')"
-
-              if [ -z "$peeled" ] || [ "$peeled" = "(null)" ]; then
-                peeled="$(git rev-parse "${tag}^{}" 2>/dev/null || true)"
-              fi
-              if [ -z "$peeled" ]; then
-                echo "WARN: cannot peel tag $tag; skip"
+          
+              # 从 tag object 里提取其指向的对象（通常是 commit）
+              target="$(git cat-file -p "$tagobj" 2>/dev/null | awk '/^object /{print $2; exit}')"
+              if [ -z "$target" ]; then
+                echo "WARN: cannot read target object from tag object $tagobj (tag=$tag); skip"
                 continue
               fi
-
-              echo "Convert annotated->lightweight: $tag (bad tagobj $tagobj) => $peeled"
-              git tag -f "$tag" "$peeled"
-
-              # 可选：打印确认类型（应为 commit/tree/blob，不应为 tag）
+          
+              echo "Convert annotated->lightweight: $tag (bad tagobj $tagobj) => $target"
+          
+              # 直接更新 refs：把 refs/tags/<tag> 指向 target（lightweight tag）
+              git update-ref "refs/tags/$tag" "$target"
+          
+              # 可选：确认现在 refs/tags/<tag> 的类型（应为 commit/tree/blob，而非 tag）
               echo "  type now: $(git cat-file -t "refs/tags/$tag")"
             done < "$LIST_FILE"
           else
