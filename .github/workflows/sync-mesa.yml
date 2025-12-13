@@ -33,10 +33,13 @@ jobs:
       SOURCE_URL: ${{ github.event.inputs.source_url || 'https://gitlab.freedesktop.org/mesa/mesa.git' }}
       TARGET_REPO: ${{ github.event.inputs.target_repo || 'geezhu/mesa' }}
       MODE: ${{ github.event.inputs.mode || 'heads-tags' }}
-      # 首次 seed 分块大小：越大越快但越容易超限；mesa 这种建议 500~2000 之间试
       SEED_STEP: "1000"
 
     steps:
+      # 关键新增：把“控制仓库”检出到 GITHUB_WORKSPACE，才能读取 bad_tag_objects.txt
+      - name: Checkout control repo
+        uses: actions/checkout@v4
+
       - name: Clone source repo (mirror)
         run: |
           set -euo pipefail
@@ -62,7 +65,6 @@ jobs:
           cd /tmp/src.git
 
           retry() {
-            # retry <cmd...>
             for n in 1 2 3; do
               "$@" && return 0
               echo "Command failed (attempt $n): $*"
@@ -71,7 +73,7 @@ jobs:
             return 1
           }
 
-          # 获取源仓库默认分支（不依赖 remote show 文本输出）
+          # 获取源仓库默认分支
           DEFAULT_REF="$(git ls-remote --symref origin HEAD | awk '/^ref:/ {print $2}' | head -n1)"
           DEFAULT_BRANCH="${DEFAULT_REF#refs/heads/}"
           if [ -z "${DEFAULT_BRANCH}" ] || [ "${DEFAULT_BRANCH}" = "${DEFAULT_REF}" ]; then
@@ -89,7 +91,6 @@ jobs:
               STEP=1000
             fi
 
-            # 取默认分支提交列表（从旧到新）
             mapfile -t COMMITS < <(git rev-list --reverse "refs/heads/${DEFAULT_BRANCH}")
             total="${#COMMITS[@]}"
             echo "Total commits on ${DEFAULT_BRANCH}: ${total}"
@@ -122,37 +123,73 @@ jobs:
             echo "Target repo already has heads -> skip seeding."
           fi
 
+          # 如果 mirror 模式：仍然会把坏 tag object 一起推过去而失败（GitHub fsck 会拒绝）
+          # 所以：mirror 模式下也先做一次“坏 tag 降级”为 lightweight（否则 mirror 可能失败）
+          echo "Sanitizing known-bad annotated tags (convert to lightweight if listed)..."
+
+          LIST_FILE="${GITHUB_WORKSPACE}/bad_tag_objects.txt"
+          if [ -f "$LIST_FILE" ]; then
+            # 映射：tag_object_sha -> tag_name -> peeled_target
+            git for-each-ref refs/tags --format='%(objectname) %(refname:short) %(peeled)' > /tmp/tag_map.txt
+
+            while read -r tagobj; do
+              [ -z "$tagobj" ] && continue
+              [[ "$tagobj" =~ ^# ]] && continue
+
+              line="$(awk -v s="$tagobj" '$1==s {print; exit}' /tmp/tag_map.txt || true)"
+              if [ -z "$line" ]; then
+                echo "WARN: cannot map bad tag object $tagobj to a tag name (maybe removed upstream); skip"
+                continue
+              fi
+
+              tag="$(echo "$line" | awk '{print $2}')"
+              peeled="$(echo "$line" | awk '{print $3}')"
+
+              if [ -z "$peeled" ] || [ "$peeled" = "(null)" ]; then
+                peeled="$(git rev-parse "${tag}^{}" 2>/dev/null || true)"
+              fi
+              if [ -z "$peeled" ]; then
+                echo "WARN: cannot peel tag $tag; skip"
+                continue
+              fi
+
+              echo "Convert annotated->lightweight: $tag (bad tagobj $tagobj) => $peeled"
+              git tag -f "$tag" "$peeled"
+
+              # 可选：打印确认类型（应为 commit/tree/blob，不应为 tag）
+              echo "  type now: $(git cat-file -t "refs/tags/$tag")"
+            done < "$LIST_FILE"
+          else
+            echo "No bad_tag_objects.txt found in control repo; skip sanitizing."
+          fi
+
           if [ "${MODE}" = "mirror" ]; then
             echo "Mode: mirror (overwrite all refs)."
-            # 经过 seed 后，一般会变成“推 refs 变化为主”，更不容易触发超大 pack
             retry git push --mirror target
             exit 0
           fi
 
           echo "Mode: heads-tags (push branches one-by-one, then tags)."
 
-          # 逐分支推送（比一次性 refs/heads/* 更稳）
           while IFS= read -r b; do
             [ -z "$b" ] && continue
             echo "Pushing branch: $b"
             retry git push target "+refs/heads/$b:refs/heads/$b"
           done < <(git for-each-ref --format='%(refname:short)' refs/heads)
-
-          echo "Pushing tags in batches (auto-skip fsck-bad tags)..."
-
+          
+          echo "Pushing tags in batches..."
+          
+          # 每批推多少个 tag（可按情况调小：20/10 更稳）
+          BATCH=2
+          
+          # 获取 tag 列表（按创建时间排序更平滑，也可以改成 --sort=refname）
           mapfile -t TAGS < <(git for-each-ref --sort=creatordate --format='%(refname:short)' refs/tags)
           TOTAL="${#TAGS[@]}"
           echo "Total tags: ${TOTAL}"
           
-          BATCH=1
-          SKIPPED_FILE="${GITHUB_WORKSPACE:-/tmp}/skipped_tags.txt"
-          : > "$SKIPPED_FILE"
-          
-          push_batch() {
+          push_tag_batch() {
             local start="$1"
             local count="$2"
-            local errfile
-            errfile="$(mktemp)"
           
             local refspecs=()
             for ((j=0; j<count; j++)); do
@@ -161,27 +198,8 @@ jobs:
               refspecs+=("+refs/tags/${t}:refs/tags/${t}")
             done
           
-            echo "Pushing tag batch: ${start}..$((start+count-1)) (count=${#refspecs[@]})"
-            if retry git push target "${refspecs[@]}" 2>"$errfile"; then
-              rm -f "$errfile"
-              return 0
-            fi
-          
-            # 把错误输出回显一下，便于 Actions 日志里定位
-            echo "Tag push failed stderr:"
-            sed -n '1,200p' "$errfile"
-          
-            # 如果是单个 tag 且命中 fsck 类错误 -> 跳过
-            if [ "$count" -eq 1 ] && grep -Eq "missingSpaceBeforeDate|fsck error|index-pack failed|remote unpack failed" "$errfile"; then
-              local bad_tag="${TAGS[$start]}"
-              echo "SKIP tag due to invalid objects: ${bad_tag}"
-              echo "${bad_tag}" >> "$SKIPPED_FILE"
-              rm -f "$errfile"
-              return 2   # 表示“跳过成功”
-            fi
-          
-            rm -f "$errfile"
-            return 1
+            echo "Pushing tags batch: ${start}..$((start+count-1)) (count=${#refspecs[@]})"
+            retry git push target "${refspecs[@]}"
           }
           
           i=0
@@ -189,36 +207,22 @@ jobs:
             n="$BATCH"
             if [ $((i+n)) -gt "$TOTAL" ]; then n=$((TOTAL-i)); fi
           
-            if push_batch "$i" "$n"; then
+            if push_tag_batch "$i" "$n"; then
               i=$((i+n))
               continue
             fi
           
-            rc=$?
-            if [ "$rc" -eq 2 ]; then
-              # 跳过了一个坏 tag
-              i=$((i+1))
-              continue
-            fi
-          
-            # 批次失败且不是“可跳过单 tag” -> 缩小批次重试
+            # 批次失败：缩小批次重试（常见原因：一次更新 refs 过多 / pack 过大 / 500 抖动）
             if [ "$n" -gt 1 ]; then
               BATCH=$((BATCH/2))
-              [ "$BATCH" -lt 1 ] && BATCH=1
-              echo "Reducing tag batch size to ${BATCH} and retrying..."
+              if [ "$BATCH" -lt 1 ]; then BATCH=1; fi
+              echo "Batch failed; reducing tag batch size to ${BATCH} and retrying..."
               continue
             fi
           
-            # 单 tag 失败但不是 fsck 类错误：当成真实异常
-            echo "Single tag push failed for ${TAGS[$i]} with non-fsck error; abort."
+            echo "Single tag push failed for tag: ${TAGS[$i]} ; abort."
             exit 1
           done
-          
-          if [ -s "$SKIPPED_FILE" ]; then
-            echo "Skipped tags (invalid objects; cannot be pushed to GitHub):"
-            cat "$SKIPPED_FILE"
-          fi
-
 
 
       - name: Cleanup
