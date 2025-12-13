@@ -2,7 +2,7 @@ name: Mirror GitLab -> GitHub (mesa)
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 0 * * *" #daily update
   workflow_dispatch:
     inputs:
       mode:
