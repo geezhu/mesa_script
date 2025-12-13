@@ -1,0 +1,78 @@
+name: Mirror GitLab -> GitHub (mesa)
+
+on:
+  schedule:
+    # 每小时同步一次
+    - cron: "0 * * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "同步模式：heads-tags=只同步分支+tag（更稳）；mirror=完全镜像（会删除远端多余 refs）"
+        type: choice
+        options: [heads-tags, mirror]
+        default: heads-tags
+      source_url:
+        description: "GitLab 源仓库地址"
+        required: true
+        default: "https://gitlab.freedesktop.org/mesa/mesa.git"
+      target_repo:
+        description: "GitHub 目标仓库（owner/name）"
+        required: true
+        default: "geezhu/mesa"
+
+# 避免定时任务重叠执行
+concurrency:
+  group: mirror-mesa-demos
+  cancel-in-progress: true
+
+# 控制仓库本身不需要写权限；写目标仓库靠 PAT
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_URL: ${{ inputs.source_url || 'https://gitlab.freedesktop.org/mesa/mesa.git' }}
+      TARGET_REPO: ${{ inputs.target_repo || 'geezhu/mesa' }}
+      MODE: ${{ inputs.mode || 'heads-tags' }}
+
+    steps:
+      - name: Clone source repo (mirror)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/src.git
+          git clone --mirror "${SOURCE_URL}" /tmp/src.git
+
+      - name: Add target remote (authenticated)
+        env:
+          TARGET_REPO_PAT: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          set -euo pipefail
+          test -n "${TARGET_REPO_PAT}" || (echo "Missing secret TARGET_REPO_PAT" && exit 1)
+
+          cd /tmp/src.git
+          git remote add target "https://x-access-token:${TARGET_REPO_PAT}@github.com/${TARGET_REPO}.git"
+
+          # 禁止 git 交互式提示（避免卡住）
+          git config --local core.askPass true
+
+      - name: Push to target repo
+        run: |
+          set -euo pipefail
+          cd /tmp/src.git
+
+          if [ "${MODE}" = "mirror" ]; then
+            echo "Mode: mirror (DANGEROUS: fully overwrite target refs)"
+            git push --mirror target
+          else
+            echo "Mode: heads-tags (sync branches + tags only)"
+            git push --prune target \
+              +refs/heads/*:refs/heads/* \
+              +refs/tags/*:refs/tags/*
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf /tmp/src.git
