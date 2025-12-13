@@ -146,7 +146,7 @@ jobs:
           TOTAL="${#TAGS[@]}"
           echo "Total tags: ${TOTAL}"
           
-          BATCH=50
+          BATCH=1
           
           push_tag_batch () {
             local start="$1"
