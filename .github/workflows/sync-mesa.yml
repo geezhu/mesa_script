@@ -138,19 +138,21 @@ jobs:
             retry git push target "+refs/heads/$b:refs/heads/$b"
           done < <(git for-each-ref --format='%(refname:short)' refs/heads)
 
-          echo "Pushing tags in batches..."
-          
-          # 取 tag 列表（按创建时间排序更利于“逐步补齐对象”）
+          echo "Pushing tags in batches (auto-skip fsck-bad tags)..."
+
           mapfile -t TAGS < <(git for-each-ref --sort=creatordate --format='%(refname:short)' refs/tags)
-          
           TOTAL="${#TAGS[@]}"
           echo "Total tags: ${TOTAL}"
           
           BATCH=1
+          SKIPPED_FILE="${GITHUB_WORKSPACE:-/tmp}/skipped_tags.txt"
+          : > "$SKIPPED_FILE"
           
-          push_tag_batch () {
+          push_batch() {
             local start="$1"
             local count="$2"
+            local errfile
+            errfile="$(mktemp)"
           
             local refspecs=()
             for ((j=0; j<count; j++)); do
@@ -159,28 +161,64 @@ jobs:
               refspecs+=("+refs/tags/${t}:refs/tags/${t}")
             done
           
-            echo "Pushing tags batch: ${start}..$((start+count-1)) (count=${#refspecs[@]})"
-            retry git push target "${refspecs[@]}"
+            echo "Pushing tag batch: ${start}..$((start+count-1)) (count=${#refspecs[@]})"
+            if retry git push target "${refspecs[@]}" 2>"$errfile"; then
+              rm -f "$errfile"
+              return 0
+            fi
+          
+            # 把错误输出回显一下，便于 Actions 日志里定位
+            echo "Tag push failed stderr:"
+            sed -n '1,200p' "$errfile"
+          
+            # 如果是单个 tag 且命中 fsck 类错误 -> 跳过
+            if [ "$count" -eq 1 ] && grep -Eq "missingSpaceBeforeDate|fsck error|index-pack failed|remote unpack failed" "$errfile"; then
+              local bad_tag="${TAGS[$start]}"
+              echo "SKIP tag due to invalid objects: ${bad_tag}"
+              echo "${bad_tag}" >> "$SKIPPED_FILE"
+              rm -f "$errfile"
+              return 2   # 表示“跳过成功”
+            fi
+          
+            rm -f "$errfile"
+            return 1
           }
           
           i=0
           while [ "$i" -lt "$TOTAL" ]; do
-            # 当前批次大小（最后一批可能不足 BATCH）
             n="$BATCH"
             if [ $((i+n)) -gt "$TOTAL" ]; then n=$((TOTAL-i)); fi
           
-            if push_tag_batch "$i" "$n"; then
+            if push_batch "$i" "$n"; then
               i=$((i+n))
-            else
-              # 批次失败则缩小批次（通常是包太大/更新 refs 太多/服务端波动）
-              BATCH=$((BATCH/2))
-              if [ "$BATCH" -lt 1 ]; then
-                echo "Tag pushing keeps failing even with batch size=1; abort."
-                exit 1
-              fi
-              echo "Batch failed; reducing BATCH to ${BATCH} and retrying..."
+              continue
             fi
+          
+            rc=$?
+            if [ "$rc" -eq 2 ]; then
+              # 跳过了一个坏 tag
+              i=$((i+1))
+              continue
+            fi
+          
+            # 批次失败且不是“可跳过单 tag” -> 缩小批次重试
+            if [ "$n" -gt 1 ]; then
+              BATCH=$((BATCH/2))
+              [ "$BATCH" -lt 1 ] && BATCH=1
+              echo "Reducing tag batch size to ${BATCH} and retrying..."
+              continue
+            fi
+          
+            # 单 tag 失败但不是 fsck 类错误：当成真实异常
+            echo "Single tag push failed for ${TAGS[$i]} with non-fsck error; abort."
+            exit 1
           done
+          
+          if [ -s "$SKIPPED_FILE" ]; then
+            echo "Skipped tags (invalid objects; cannot be pushed to GitHub):"
+            cat "$SKIPPED_FILE"
+          fi
+
 
 
       - name: Cleanup
