@@ -2,7 +2,7 @@
 
 ### Language
 
-**English**|**[中文][README.zh-CN.md]**
+**English**|**[中文](README.zh-CN.md)**
 
 
 ## 0. Summary: What the workflow changes (and what it doesn’t)
