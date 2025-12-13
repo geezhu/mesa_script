@@ -2,7 +2,7 @@ name: Mirror GitLab -> GitHub (mesa)
 
 on:
   schedule:
-    - cron: "0 0 * * *" #daily update
+    - cron: "17 3 * * *" #daily update ,trigger when 3:17 UTC to avoid hotspot
   workflow_dispatch:
     inputs:
       mode:
