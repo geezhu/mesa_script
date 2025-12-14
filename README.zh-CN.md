@@ -12,8 +12,8 @@
 
 1. **把已知“坏的 annotated tag”降级为 lightweight tag（方案 A）**
 
-* 原状态：`refs/tags/<TAG>` → 指向一个 **commit**
-* 处理后：`refs/tags/<TAG>` → 直接指向该 tag object 中 `object <SHA>` 对应的 **commit**
+* 原状态：`refs/tags/<TAG>` → 一个坏的 annotated tag指向一个 **commit**
+* 处理后：`refs/tags/<TAG>` → 使用lightweight tag直接指向该 tag object 中 `object <SHA>` 对应的 **commit**
 * 目的：避免 GitHub 接收端在 `fsck/index-pack` 校验时，因为 tag object 不合法而拒收推送。
 
 ---
