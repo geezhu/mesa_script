@@ -17,7 +17,7 @@ Before pushing to the GitHub target repository, the workflow performs a required
 
 1. **Downgrade known-broken annotated tags to lightweight tags (Plan A)**
 
-   * Before: `refs/tags/<TAG>` → points to a **commit** (type: `commit`) with mail address
+   * Before: `refs/tags/<TAG>` → a record with mail address points to a **commit** (type: `commit`)
    * After:  `refs/tags/<TAG>` → directly points to the **commit** referenced by `object <SHA>` inside that tag object
    * Goal: prevent GitHub’s receive-side validation (`fsck/index-pack`) from rejecting pushes due to malformed tag objects.
 
